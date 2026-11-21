@@ -1,0 +1,22 @@
+# Build & dependencies của PlatformIO / ESP-IDF
+**/.pio/
+**/managed_components/
+**/dependencies.lock
+**/build/
+**/sdkconfig
+
+# File cấu hình máy cá nhân của VS Code / Cursor
+**/.vscode/*
+!**/.vscode/settings.json
+!**/.vscode/tasks.json
+!**/.vscode/extensions.json
+
+# File nhạy cảm (mật khẩu Wi-Fi, API key, token...)
+**/secrets.h
+**/*secret*
+.env
+
+# File rác hệ thống Xubuntu / Linux
+.DS_Store
+Thumbs.db
+*.log
