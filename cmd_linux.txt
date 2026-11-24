@@ -1,0 +1,1 @@
+tree -a -I '.git|.pio|build|__pycache__|node_modules|managed_components|kicad_schematic' > tree.txt

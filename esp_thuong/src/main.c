@@ -1,58 +1,21 @@
-// ESP_THUONG - ESP-IDF / PlatformIO. Application source: src/main.c
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-#include "esp_heap_caps.h"
-#include "esp_rom_crc.h"
-#include "esp_err.h"
+// Regular ESP32: LCD, PN532, LAN requests and application modes.
+#include "my_library.h"
+#include "secrets.h"
+#include "diagnostic_wifi.h"
 
-enum { SLOT=32760, HEAD=20, CAP=SLOT-HEAD, DIM=512,
-       START=1, POLL, END_SESSION, IDLE=16, AIM, SAMPLING, MATCH, DENIED,
-       NO_FACE, BAD_REF, CAM_FAIL, AI_FAIL, LINK_FAIL, ENROLLED, ENROLL=4 };
-// Versioned template: MFN_S8_V1, ESP-DL 3.3.15, RGB888 preprocessing.
-#define TEMPLATE_VERSION 0x03331501u
-typedef struct {
-    uint32_t version;
-    float vector[DIM];
-} face_template_t;
-typedef char template_layout_check[(sizeof(face_template_t) == 2052) ? 1 : -1];
-typedef struct {
-    uint32_t magic, session, kind, size, crc;
-    uint8_t data[CAP];
-} packet_t;
-typedef char slot_layout_check[(sizeof(packet_t)==SLOT)?1:-1];
-static inline uint32_t checksum(const packet_t *p) {
-    uint32_t v=esp_rom_crc32_le(0,(const uint8_t*)p,16);
-    return esp_rom_crc32_le(v,p->data,p->size);
-}
-static inline void seal(packet_t *p,uint32_t session,uint32_t kind,uint32_t bytes) {
-    p->magic=0x34454346;
-    p->session=session; p->kind=kind; p->size=bytes;
-    p->crc=checksum(p);
-}
-static inline int valid(const packet_t *p) {
-    return p->magic==0x34454346 && p->size<=CAP && p->crc==checksum(p);
-}
-static inline packet_t *new_slot(void) {
-    packet_t *p=(packet_t*)heap_caps_calloc(1,SLOT,MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
-    ESP_ERROR_CHECK(p ? ESP_OK : ESP_ERR_NO_MEM);
-    return p;
-}
-
-// SPI chỉ ghi hình. SDO/GPIO13 có thể vẫn nối vật lý theo sơ đồ.
+// Write-only SPI. SDO/GPIO13 can remain physically connected per schematic.
 #define TFT_CS_GPIO   21
 #define TFT_RST_GPIO  19
 #define TFT_DC_GPIO   18
 #define TFT_MOSI_GPIO 17
 #define TFT_SCK_GPIO  16
-#define TFT_BL_GPIO    4    // -1 nếu đèn nền được cấp qua mạch riêng
+#define TFT_BL_GPIO    4    // -1 if backlight is powered via a separate circuit
 #define TFT_BL_ON      1
 
-#define TFT_SPI_MODE   3    // giá trị từ esp_thuong.ino
+#define TFT_SPI_MODE   3    // value from esp_thuong.ino
 #define TFT_SPI_HZ     10000000
-#define TFT_BGR        0    // đổi thành 1 nếu đỏ và xanh dương hoán đổi
-#define TFT_INVERT     0    // Tắt đảo màu trên ST7789
+#define TFT_BGR        0    // set to 1 if red and blue are swapped
+#define TFT_INVERT     0    // Disable color inversion on ST7789
 #define TFT_MIRROR_X   1
 #define TFT_MIRROR_Y   1
 #define TFT_X_GAP      0
@@ -64,16 +27,6 @@ static inline packet_t *new_slot(void) {
 #define PANEL_H 320
 #define CROP_W 180
 
-
-#include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "esp_heap_caps.h"
-#include "esp_jpeg_dec.h"
-#include "esp_lcd_io_spi.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_log.h"
 
 enum { STRIPE_ROWS = 16, ROW_BYTES = CAM_WIDTH * 2, STRIPE_BYTES = ROW_BYTES * STRIPE_ROWS };
 static const char *LCD_TAG = "U2_LCD";
@@ -124,10 +77,16 @@ void display_init(void)
 static void overlay(int y,int rows);
 static void draw_stripe(int y, int rows)
 {
-    overlay(y,rows);
+    preview_unmirror(portrait, PANEL_W, rows);
+    overlay(y, rows);
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd, 0, y, PANEL_W, y + rows, portrait));
-    // tx_param đợi toàn bộ DMA trước nó. Lệnh NOP của ST7789 cho phép dùng lại stripe.
+    // tx_param waits for all prior DMA transfers. ST7789 NOP allows reusing stripe.
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(lcd_io, 0x00, NULL, 0));
+    if (dump_lcd) {
+        size_t bytes=(size_t)rows*PANEL_W*2;
+        dump_lcd_hash=dump_hash(dump_lcd_hash,portrait,bytes);
+        dump_data(1000,(unsigned)y*PANEL_W*2,portrait,bytes);
+    }
 }
 
 bool display_jpeg(uint8_t *data, size_t length)
@@ -198,14 +157,6 @@ done:
     jpeg_dec_close(dec);
     return ok;
 }
-#include <math.h>
-#include "nvs.h"
-#include "nvs_flash.h"
-#include "esp_random.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
 #define CS GPIO_NUM_26
 #define READY GPIO_NUM_33
 #define BOOT GPIO_NUM_0
@@ -213,29 +164,6 @@ static spi_device_handle_t spi_link;
 static packet_t *tx,*rx;
 static const char *label;
 static uint16_t color;
-static nvs_handle_t face_store;
-static bool storage_ready;
-static bool template_valid(const face_template_t *value) {
-    if (value->version != TEMPLATE_VERSION) return false;
-    double norm = 0;
-    for (int i = 0; i < DIM; ++i) norm += (double)value->vector[i] * value->vector[i];
-    return isfinite(norm) && norm > 0.99 && norm < 1.01;
-}
-static bool load_template(face_template_t *value) {
-    size_t size = sizeof(*value);
-    return storage_ready && nvs_get_blob(face_store, "template", value, &size) == ESP_OK &&
-           size == sizeof(*value) && template_valid(value);
-}
-static bool save_template(const packet_t *packet) {
-    if (!storage_ready || packet->size != sizeof(face_template_t)) return false;
-    face_template_t value;
-    memcpy(&value, packet->data, sizeof(value));
-    if (!template_valid(&value)) return false;
-    esp_err_t rc = nvs_set_blob(face_store, "template", &value, sizeof(value));
-    if (rc == ESP_OK) rc = nvs_commit(face_store);
-    ESP_LOGI("FACE", "Save enrollment: %s", esp_err_to_name(rc));
-    return rc == ESP_OK;
-}
 // Uppercase 5x7 column font, least significant bit at the top.
 static const uint8_t font[][5]={
  {126,17,17,17,126},{127,73,73,73,54},{62,65,65,65,34},{127,65,65,34,28},
@@ -289,99 +217,537 @@ static bool exchange(void) {
     sleep_ms(10);
     return rc==ESP_OK && valid(rx);
 }
-static void session(bool enroll) {
-    uint32_t id;
-    do { id=esp_random(); } while(!id);
-    esp_lcd_panel_disp_on_off(lcd,true);
-    message("DUA MAT VAO KHUNG",0xffff); gpio_set_level(TFT_BL_GPIO,TFT_BL_ON);
-    if (!storage_ready) { message("LOI BO NHO NVS", 0xf800); return; }
-    face_template_t value;
-    if (enroll) {
-        message("DANG KY MAT", 0xffe0);
-        seal(tx, id, ENROLL, 0);
-    } else {
-        if (!load_template(&value)) { message("GIU BOOT BA GIAY", 0xffe0); return; }
-        memcpy(tx->data, &value, sizeof(value));
-        seal(tx, id, START, sizeof(value));
-    }
-    int64_t limit=esp_timer_get_time()+40000000, wake_again=0;
-    bool ack=false, completed=false;
-    while(esp_timer_get_time()<limit) {
-        int64_t now=esp_timer_get_time();
-        if(!gpio_get_level(READY)) {
-            if(!ack && now>=wake_again) {
-                // CS pulse with no SPI clocks wakes U1 from GPIO light sleep.
-                gpio_set_level(CS,0); sleep_ms(45); gpio_set_level(CS,1);
-                wake_again=now+1500000;
-            }
-            sleep_ms(20); continue;
+#include "diagnostics.h"
+
+static app_mode_t mode = MODE_SLEEP;
+static int64_t wait_deadline;
+static bool preview_enabled;
+static bool preview_ack;
+static uint32_t preview_id;
+static int64_t preview_wake_at;
+static int64_t preview_last_frame;
+static int64_t preview_last_poll;
+static char response_body[HTTP_RESPONSE_CAP];
+static uint8_t image_chunk[IMAGE_CHUNK_SIZE];
+static face_template_t active_template;
+static char held_uid[21];
+static unsigned absent_reads;
+static bool nfc_ok;
+static unsigned nfc_error_count;
+static portMUX_TYPE button_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool button_pending;
+static int64_t button_down_us;
+static int64_t button_up_us;
+
+static void boot_interrupt(void *argument)
+{
+    (void)argument;
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&button_lock);
+    if (!gpio_get_level(BOOT)) {
+        // Ignore contact bounce on an already pending press.
+        if (!button_pending) {
+            button_pending = true;
+            button_down_us = now;
+            button_up_us = 0;
         }
-        if(!exchange() || rx->session!=id) continue;
-        if(rx->kind<AIM || rx->kind>ENROLLED) continue;
-        if(!ack) { ack=true; seal(tx,id,POLL,0); }
-        if(rx->kind==AIM || rx->kind==SAMPLING) {
-            label=rx->kind==AIM?"DUA MAT VAO KHUNG":"GIU YEN";
-            color=rx->kind==AIM?0xffff:0xffe0;
-            if(rx->size) display_jpeg(rx->data,rx->size);
+    } else if (button_pending) {
+        button_up_us = now;
+    }
+    portEXIT_CRITICAL_ISR(&button_lock);
+}
+
+static bool boot_requested(void)
+{
+    portENTER_CRITICAL(&button_lock);
+    bool pending = button_pending;
+    portEXIT_CRITICAL(&button_lock);
+    return pending || !gpio_get_level(BOOT);
+}
+
+static void clear_boot_event(void)
+{
+    portENTER_CRITICAL(&button_lock);
+    button_pending = false;
+    button_down_us = 0;
+    button_up_us = 0;
+    portEXIT_CRITICAL(&button_lock);
+}
+
+static uint32_t new_session_id(void)
+{
+    uint32_t id;
+    do { id = esp_random(); } while (!id);
+    return id;
+}
+
+static void new_event_id(char output[80])
+{
+    snprintf(output, 80, "%s-%08lx%08lx", DEVICE_ID,
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+}
+
+static void preview_begin(void)
+{
+    preview_id = new_session_id();
+    preview_ack = false;
+    preview_enabled = true;
+    preview_wake_at = 0;
+    preview_last_poll = 0;
+    preview_last_frame = esp_timer_get_time();
+}
+
+static void preview_pump(void)
+{
+    if (!preview_enabled) return;
+    int64_t now = esp_timer_get_time();
+    if (now - preview_last_poll < 50000) return; // Cap requests at about 20 FPS.
+    preview_last_poll = now;
+    if (!gpio_get_level(READY)) {
+        if (!preview_ack && now >= preview_wake_at) {
+            gpio_set_level(CS, 0); sleep_ms(45); gpio_set_level(CS, 1);
+            preview_wake_at = now + 1500000;
+        }
+    } else {
+        seal(tx, preview_id, preview_ack ? POLL : STREAM, 0);
+        if (exchange() && rx->session == preview_id && rx->kind == STREAM_FRAME) {
+            preview_ack = true;
+            preview_last_frame = now;
+            if (rx->size) display_jpeg(rx->data, rx->size);
+        }
+    }
+    if (now - preview_last_frame > 15000000) {
+        ESP_LOGW("FACE", "Preview timeout; reopen SPI stream");
+        preview_begin();
+    }
+}
+
+static void enter_work(void)
+{
+    mode = MODE_WORK;
+    ESP_LOGI("APP", "MODE=2 WORK");
+    esp_lcd_panel_disp_on_off(lcd, true);
+    gpio_set_level(TFT_BL_GPIO, TFT_BL_ON);
+    if (!preview_enabled) preview_begin();
+}
+
+static void enter_wait(void)
+{
+    mode = MODE_WAIT;
+    wait_deadline = esp_timer_get_time() + (int64_t)WAIT_SECONDS * 1000000;
+    if (!preview_enabled) preview_begin();
+    ESP_LOGI("APP", "MODE=1 WAIT, %d seconds", WAIT_SECONDS);
+}
+
+static void enter_sleep(void)
+{
+    preview_enabled = false;
+    uint32_t id = preview_id ? preview_id : new_session_id();
+    seal(tx, id, END_SESSION, 0);
+    // S3 accepts END_SESSION regardless of its previous session ID.
+    int64_t deadline = esp_timer_get_time() + 3000000;
+    while (!gpio_get_level(READY) && esp_timer_get_time() < deadline) sleep_ms(10);
+    if (gpio_get_level(READY)) exchange();
+    gpio_set_level(TFT_BL_GPIO, !TFT_BL_ON);
+    esp_lcd_panel_disp_on_off(lcd, false);
+    wifi_suspend();
+    memset(&active_template, 0, sizeof(active_template));
+    memset(tx->data, 0, sizeof(face_template_t));
+    mode = MODE_SLEEP;
+    ESP_LOGI("APP", "MODE=0 SLEEP; PN532 remains powered, timer polls every %d ms", NFC_SLEEP_POLL_MS);
+}
+
+static void idle_sleep_once(void)
+{
+    // UART output must drain before clock suspension. BOOT low wakes immediately.
+    fflush(stdout);
+    gpio_wakeup_enable(BOOT, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+    esp_sleep_enable_timer_wakeup((uint64_t)NFC_SLEEP_POLL_MS * 1000);
+    if (gpio_get_level(BOOT)) {
+        esp_err_t rc = esp_light_sleep_start();
+        if (rc != ESP_OK) sleep_ms(20);
+    }
+    gpio_wakeup_disable(BOOT);
+    gpio_set_intr_type(BOOT, GPIO_INTR_ANYEDGE);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+}
+
+static bool json_string(cJSON *root, const char *key, char *out, size_t capacity)
+{
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(value) || !value->valuestring || strlen(value->valuestring) >= capacity) return false;
+    strcpy(out, value->valuestring);
+    return true;
+}
+
+static cJSON *json_request(const char *path, cJSON *data)
+{
+    if (!data) return NULL;
+    char *body = cJSON_PrintUnformatted(data);
+    cJSON_Delete(data);
+    if (!body) return NULL;
+    int status = 0;
+    bool ok = server_request(path, body, strlen(body), "application/json",
+                             response_body, sizeof(response_body), &status, preview_pump);
+    cJSON_free(body);
+    if (!ok) {
+        message(status == 401 ? "INVALID API KEY" : "WIFI SERVER ERROR", 0xf800);
+        return NULL;
+    }
+    cJSON *reply = cJSON_Parse(response_body);
+    if (!cJSON_IsObject(reply)) {
+        cJSON_Delete(reply);
+        message("SERVER DATA ERROR", 0xf800);
+        return NULL;
+    }
+    return reply;
+}
+
+static bool template_from_json(cJSON *root)
+{
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "model_version");
+    cJSON *encoded = cJSON_GetObjectItemCaseSensitive(root, "embedding_b64");
+    cJSON *threshold = cJSON_GetObjectItemCaseSensitive(root, "threshold");
+    if (!cJSON_IsNumber(version) || version->valuedouble != TEMPLATE_VERSION ||
+        !cJSON_IsString(encoded) || !encoded->valuestring || !cJSON_IsNumber(threshold) ||
+        fabs(threshold->valuedouble - FACE_THRESHOLD) > 0.00001) return false;
+    size_t written = 0;
+    int rc = mbedtls_base64_decode((unsigned char *)active_template.vector,
+        sizeof(active_template.vector), &written, (const unsigned char *)encoded->valuestring,
+        strlen(encoded->valuestring));
+    if (rc || written != sizeof(active_template.vector)) return false;
+    double norm = 0;
+    for (int i = 0; i < DIM; ++i) norm += (double)active_template.vector[i] * active_template.vector[i];
+    if (!isfinite(norm) || norm < 0.99 || norm > 1.01) return false;
+    active_template.version = TEMPLATE_VERSION;
+    return true;
+}
+
+static uint32_t run_face(bool enroll, float *score, uint32_t *capture_id)
+{
+    preview_enabled = false;
+    uint32_t id = new_session_id();
+    *capture_id = id;
+    *score = NAN;
+    if (enroll) seal(tx, id, ENROLL, 0);
+    else {
+        memcpy(tx->data, &active_template, sizeof(active_template));
+        seal(tx, id, START, sizeof(active_template));
+    }
+    label = enroll ? "ENROLLING FACE" : "ALIGN FACE IN FRAME";
+    color = 0xffe0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)FACE_TIMEOUT_SECONDS * 1000000;
+    int64_t wake_at = 0;
+    bool ack = false;
+    uint32_t result = LINK_FAIL;
+    while (esp_timer_get_time() < deadline) {
+        if (!gpio_get_level(READY)) {
+            if (!ack && esp_timer_get_time() >= wake_at) {
+                gpio_set_level(CS, 0); sleep_ms(45); gpio_set_level(CS, 1);
+                wake_at = esp_timer_get_time() + 1500000;
+            }
+            sleep_ms(10); continue;
+        }
+        if (!exchange() || rx->session != id) continue;
+        if (rx->kind < AIM || rx->kind > ENROLLED) continue;
+        ack = true;
+        seal(tx, id, POLL, 0);
+        if (rx->kind == AIM || rx->kind == SAMPLING) {
+            label = rx->kind == AIM ? "ALIGN FACE IN FRAME" : "HOLD STILL";
+            if (rx->size) display_jpeg(rx->data, rx->size);
             continue;
         }
-        if((rx->kind==MATCH || rx->kind==DENIED) && rx->size!=sizeof(float)) continue;
-        if(rx->kind==MATCH || rx->kind==DENIED) {
-            float score; memcpy(&score,rx->data,sizeof(score));
-            ESP_LOGI("FACE","cosine %.3f",score);
-        }
-        if (rx->kind == ENROLLED && !enroll) continue;
-        if (enroll && (rx->kind == MATCH || rx->kind == DENIED)) continue;
-        completed=true;
-        switch(rx->kind) {
-        case ENROLLED:
-            if (save_template(rx)) message("DA LUU MAU", 0x07e0);
-            else message("LOI LUU MAU", 0xf800);
-            break;
-        case MATCH: message("KHOP",0x07e0); break;
-        case DENIED: message("KHONG KHOP",0xf800); break;
-        case NO_FACE: message("CHUA THAY MAT",0xffe0); break;
-        case BAD_REF: message("LOI EMBEDDING",0xf800); break;
-        case CAM_FAIL: message("LOI CAMERA",0xf800); break;
-        default: message("LOI AI",0xf800); break;
+        if (enroll && rx->kind == ENROLLED && rx->size == sizeof(active_template)) {
+            memcpy(&active_template, rx->data, sizeof(active_template));
+            result = ENROLLED;
+        } else if (!enroll && (rx->kind == MATCH || rx->kind == DENIED) && rx->size == sizeof(float)) {
+            memcpy(score, rx->data, sizeof(float));
+            if (!isfinite(*score) || *score < -1.001f || *score > 1.001f) result = AI_FAIL;
+            else result = rx->kind;
+        } else if (rx->kind >= NO_FACE && rx->kind <= LINK_FAIL) {
+            result = rx->kind;
+        } else {
+            result = AI_FAIL;
         }
         break;
     }
-    if(!completed) message("MAT KET NOI SPI",0xf800);
-    if(ack) {
-        seal(tx,id,END_SESSION,0);
-        for(int i=0;i<100 && !gpio_get_level(READY);i++) sleep_ms(10);
-        exchange();
-    }
-    memset(tx->data,0,sizeof(face_template_t));
+    preview_begin();
+    preview_pump();
+    return result;
 }
-void app_main(void) {
-    esp_err_t storage_error = nvs_flash_init();
-    if (storage_error == ESP_OK) storage_error = nvs_open("face_v3", NVS_READWRITE, &face_store);
-    storage_ready = storage_error == ESP_OK;
-    if (!storage_ready) ESP_LOGE("FACE", "NVS init: %s", esp_err_to_name(storage_error));
-    tx=new_slot(); rx=new_slot();
-    gpio_set_level(CS,1); gpio_set_direction(CS,GPIO_MODE_OUTPUT);
-    gpio_set_direction(BOOT,GPIO_MODE_INPUT); gpio_pullup_en(BOOT);
-    gpio_set_direction(READY,GPIO_MODE_INPUT); gpio_pulldown_en(READY);
+
+static void show_face_error(uint32_t result)
+{
+    switch (result) {
+        case NO_FACE: message("NO FACE DETECTED", 0xffe0); break;
+        case CAM_FAIL: message("CAMERA ERROR", 0xf800); break;
+        case BAD_REF: message("EMBEDDING ERROR", 0xf800); break;
+        case LINK_FAIL: message("SPI LINK LOST", 0xf800); break;
+        default: message("AI ERROR", 0xf800); break;
+    }
+}
+
+static void verify_card(const char *uid)
+{
+    enter_work();
+    message("QUERYING SERVER", 0xffe0);
+    char event_id[80], ticket[768], status[32];
+    new_event_id(event_id);
+    cJSON *request = cJSON_CreateObject();
+    cJSON_AddStringToObject(request, "uid", uid);
+    cJSON_AddStringToObject(request, "event_id", event_id);
+    cJSON *reply = json_request("/api/lookup", request);
+    if (!reply) goto finished;
+    if (!json_string(reply, "status", status, sizeof(status))) {
+        cJSON_Delete(reply); message("SERVER DATA ERROR", 0xf800); goto finished;
+    }
+    if (strcmp(status, "approved") != 0) {
+        message(strcmp(status, "unregistered") == 0 ? "UNREGISTERED" :
+                strcmp(status, "pending") == 0 ? "PENDING APPROVAL" : "ACCESS DENIED", 0xffe0);
+        ESP_LOGI("APP", "UID=%s denied: %s", uid, status);
+        cJSON_Delete(reply); goto finished;
+    }
+    cJSON *server_time = cJSON_GetObjectItemCaseSensitive(reply, "server_time");
+    int64_t epoch = cJSON_IsNumber(server_time) ? (int64_t)server_time->valuedouble : 0;
+    int64_t synchronized_at = esp_timer_get_time();
+    if (!template_from_json(reply) || !json_string(reply, "ticket", ticket, sizeof(ticket)) || !epoch) {
+        cJSON_Delete(reply); message("SERVER MODEL ERROR", 0xf800); goto finished;
+    }
+    cJSON_Delete(reply);
+    float score;
+    uint32_t capture_id;
+    uint32_t result = run_face(false, &score, &capture_id);
+    bool face_result = result == MATCH || result == DENIED;
+    const char *reason = face_result ? "face_result" : result == NO_FACE ? "no_face" :
+                         result == CAM_FAIL ? "camera_error" : result == LINK_FAIL ? "spi_timeout" : "ai_error";
+    request = cJSON_CreateObject();
+    cJSON_AddStringToObject(request, "uid", uid);
+    cJSON_AddStringToObject(request, "event_id", event_id);
+    cJSON_AddStringToObject(request, "ticket", ticket);
+    cJSON_AddStringToObject(request, "reason", reason);
+    cJSON_AddNumberToObject(request, "device_time", epoch + (esp_timer_get_time()-synchronized_at)/1000000);
+    cJSON_AddNumberToObject(request, "matched", result == MATCH ? 1 : 0);
+    if (face_result) cJSON_AddNumberToObject(request, "score", score);
+    else cJSON_AddNullToObject(request, "score");
+    message("SENDING RESULT", 0xffe0);
+    reply = json_request("/api/attendance", request);
+    if (reply) {
+        cJSON *saved = cJSON_GetObjectItemCaseSensitive(reply, "saved");
+        cJSON *matched = cJSON_GetObjectItemCaseSensitive(reply, "matched");
+        if (!cJSON_IsTrue(saved) || !cJSON_IsNumber(matched)) message("SAVE FAILED", 0xf800);
+        else if (matched->valueint == 1) message("CHECK IN OK", 0x07e0);
+        else if (face_result) message("CHECK IN DENIED", 0xf800);
+        else show_face_error(result);
+        ESP_LOGI("APP", "UID=%s score=%.4f reply=%.160s", uid, score, response_body);
+        cJSON_Delete(reply);
+    }
+finished:
+    memset(&active_template, 0, sizeof(active_template));
+    enter_wait();
+}
+
+static bool get_image_chunk(uint32_t capture_id, uint32_t offset, uint32_t *total, uint32_t *length)
+{
+    // A fresh STREAM must be acknowledged before addressing its retained image.
+    int64_t deadline = esp_timer_get_time() + 10000000;
+    while (!preview_ack && esp_timer_get_time() < deadline) {
+        preview_pump(); sleep_ms(10);
+    }
+    if (!preview_ack) return false;
+    while (esp_timer_get_time() < deadline) {
+        if (!gpio_get_level(READY)) { sleep_ms(10); continue; }
+        memcpy(tx->data, &capture_id, 4);
+        memcpy(tx->data+4, &offset, 4);
+        seal(tx, preview_id, IMAGE_GET, 8);
+        if (!exchange() || rx->session != preview_id) continue;
+        if (rx->kind == STREAM_FRAME && rx->size) {
+            display_jpeg(rx->data, rx->size); continue;
+        }
+        if (rx->kind != IMAGE_DATA || rx->size <= 12 || rx->size > IMAGE_CHUNK_SIZE+12) continue;
+        uint32_t got_id, got_offset, got_total;
+        memcpy(&got_id, rx->data, 4); memcpy(&got_total, rx->data+4, 4);
+        memcpy(&got_offset, rx->data+8, 4);
+        if (got_id != capture_id || got_offset != offset) continue;
+        uint32_t bytes = rx->size - 12;
+        if (!got_total || got_total > MAX_ENROLL_JPEG_SIZE || offset > got_total || bytes > got_total-offset) return false;
+        memcpy(image_chunk, rx->data+12, bytes);
+        *total = got_total; *length = bytes;
+        return true;
+    }
+    return false;
+}
+
+static bool upload_enrollment(const char *enrollment_id, const char *uid, uint32_t capture_id)
+{
+    uint32_t total, length;
+    if (!get_image_chunk(capture_id, 0, &total, &length)) {
+        message("S3 IMAGE ERROR", 0xf800); return false;
+    }
+    unsigned char encoded[DIM*4*4/3+8];
+    size_t encoded_length = 0;
+    if (mbedtls_base64_encode(encoded, sizeof(encoded), &encoded_length,
+        (unsigned char *)active_template.vector, sizeof(active_template.vector))) return false;
+    encoded[encoded_length] = 0;
+    cJSON *request = cJSON_CreateObject();
+    cJSON_AddStringToObject(request, "enrollment_id", enrollment_id);
+    cJSON_AddStringToObject(request, "uid", uid);
+    cJSON_AddStringToObject(request, "embedding_b64", (const char *)encoded);
+    cJSON_AddNumberToObject(request, "model_version", active_template.version);
+    cJSON_AddNumberToObject(request, "image_size", total);
+    cJSON *reply = json_request("/api/enrollment/metadata", request);
+    if (!reply) return false;
+    cJSON_Delete(reply);
+    uint32_t offset = 0;
+    bool completed = false;
+    while (offset < total) {
+        uint32_t got_total;
+        if (!get_image_chunk(capture_id, offset, &got_total, &length) || got_total != total) {
+            message("S3 IMAGE ERROR", 0xf800); return false;
+        }
+        char path[160];
+        snprintf(path, sizeof(path), "/api/enrollment/image?id=%s&offset=%lu", enrollment_id, (unsigned long)offset);
+        int status = 0;
+        if (!server_request(path, image_chunk, length, "image/jpeg", response_body,
+                            sizeof(response_body), &status, preview_pump)) {
+            message("IMAGE UPLOAD ERROR", 0xf800); return false;
+        }
+        reply = cJSON_Parse(response_body);
+        cJSON *ack = cJSON_GetObjectItemCaseSensitive(reply, "offset");
+        cJSON *done = cJSON_GetObjectItemCaseSensitive(reply, "complete");
+        bool accepted = cJSON_IsNumber(ack) && ack->valuedouble == offset + length;
+        completed = cJSON_IsTrue(done);
+        cJSON_Delete(reply);
+        if (!accepted) { message("IMAGE OFFSET ERROR", 0xf800); return false; }
+        offset += length;
+        ESP_LOGI("ENROLL", "JPEG %lu/%lu", (unsigned long)offset, (unsigned long)total);
+    }
+    return completed;
+}
+
+static void register_user(void)
+{
+    message("STARTING ENROLL", 0xffe0);
+    char event_id[80], enrollment_id[64], uid[21];
+    new_event_id(event_id);
+    cJSON *request = cJSON_CreateObject();
+    cJSON_AddStringToObject(request, "event_id", event_id);
+    cJSON *reply = json_request("/api/enrollment/start", request);
+    if (!reply) goto finished;
+    bool ready = json_string(reply, "enrollment_id", enrollment_id, sizeof(enrollment_id));
+    cJSON_Delete(reply);
+    if (!ready) { message("SERVER DATA ERROR", 0xf800); goto finished; }
+    message("SCAN CARD TO ENROLL", 0xffe0);
+    int64_t deadline = esp_timer_get_time() + (int64_t)ENROLL_CARD_TIMEOUT_SECONDS * 1000000;
+    bool found = false;
+    while (esp_timer_get_time() < deadline) {
+        preview_pump();
+        if (pn532_read_uid(uid, preview_pump) == 1) { found = true; break; }
+        sleep_ms(20);
+    }
+    if (!found) { message("CARD SCAN TIMEOUT", 0xffe0); goto finished; }
+    strcpy(held_uid, uid); absent_reads = 0;
+    float ignored;
+    uint32_t capture_id;
+    uint32_t result = run_face(true, &ignored, &capture_id);
+    if (result != ENROLLED) { show_face_error(result); goto finished; }
+    message("UPLOADING ENROLL", 0xffe0);
+    if (upload_enrollment(enrollment_id, uid, capture_id)) {
+        message("PENDING APPROVAL", 0x07e0);
+        ESP_LOGI("ENROLL", "UID=%s saved pending; approve on PC", uid);
+    }
+finished:
+    memset(&active_template, 0, sizeof(active_template));
+    enter_wait();
+}
+
+static void boot_action(void)
+{
+    portENTER_CRITICAL(&button_lock);
+    int64_t pressed_at = button_down_us;
+    int64_t released_at = button_up_us;
+    portEXIT_CRITICAL(&button_lock);
+    if (!pressed_at) pressed_at = esp_timer_get_time();
+    if (released_at && released_at - pressed_at < 25000) {
+        clear_boot_event(); return;
+    }
+    enter_work();
+    message("RELEASE TO ENROLL", 0xffe0);
+    bool held = released_at && released_at - pressed_at >= 2000000;
+    while (!gpio_get_level(BOOT)) {
+        preview_pump();
+        if (esp_timer_get_time() - pressed_at >= 2000000) { held = true; break; }
+        sleep_ms(10);
+    }
+    if (held) {
+        preview_enabled = false;
+        diagnostic_session();
+        preview_begin();
+        enter_wait();
+    } else {
+        register_user();
+    }
+    // Never interpret the release of a long press as a new short press.
+    while (!gpio_get_level(BOOT)) { preview_pump(); sleep_ms(10); }
+    sleep_ms(30);
+    clear_boot_event();
+}
+
+void app_main(void)
+{
+    esp_err_t rc = nvs_flash_init();
+    // Do not silently erase NVS on an initialization error.
+    ESP_ERROR_CHECK(rc);
+    tx = new_slot(); rx = new_slot();
+    gpio_set_level(CS, 1); gpio_set_direction(CS, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BOOT, GPIO_MODE_INPUT); gpio_pullup_en(BOOT);
+    gpio_set_direction(READY, GPIO_MODE_INPUT); gpio_pulldown_en(READY);
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_set_intr_type(BOOT, GPIO_INTR_ANYEDGE));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BOOT, boot_interrupt, NULL));
+    label = "BOOTING"; color = 0xffff;
     display_init();
-    spi_bus_config_t b={.sclk_io_num=14,.mosi_io_num=27,.miso_io_num=25,
-        .quadhd_io_num=-1,.quadwp_io_num=-1,.max_transfer_sz=SLOT};
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST,&b,SPI_DMA_CH_AUTO));
-    spi_device_interface_config_t d={.clock_speed_hz=4000000,.mode=3,.spics_io_num=-1,.queue_size=1};
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST,&d,&spi_link));
-    ESP_LOGI("FACE", "U2 ready: press BOOT to verify, hold 3s to enroll");
-    while(true) {
-        while(gpio_get_level(BOOT)) sleep_ms(20);
-        sleep_ms(35);
-        if(gpio_get_level(BOOT)) continue;
-        // Short press verifies. Hold 3 seconds enrolls/replaces the stored face.
-        int64_t pressed_at = esp_timer_get_time();
-        while (!gpio_get_level(BOOT) && esp_timer_get_time() - pressed_at < 3000000) sleep_ms(10);
-        bool enroll = !gpio_get_level(BOOT);
-        session(enroll);
-        sleep_ms(2500);
-        gpio_set_level(TFT_BL_GPIO,!TFT_BL_ON); esp_lcd_panel_disp_on_off(lcd,false);
-        while(!gpio_get_level(BOOT)) sleep_ms(20);
+    spi_bus_config_t bus = {.sclk_io_num=14, .mosi_io_num=27, .miso_io_num=25,
+        .quadhd_io_num=-1, .quadwp_io_num=-1, .max_transfer_sz=SLOT};
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_CH_AUTO));
+    spi_device_interface_config_t device = {.clock_speed_hz=4000000, .mode=3,
+                                            .spics_io_num=-1, .queue_size=1};
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &device, &spi_link));
+    ESP_ERROR_CHECK(services_init());
+    nfc_ok = pn532_init();
+    ESP_LOGI("APP", "Short BOOT: enrollment; hold 2s: USB capture. PN532 SDA22 SCL23");
+    enter_sleep();
+    int64_t nfc_retry_at = 0;
+    for (;;) {
+        if (boot_requested()) { boot_action(); continue; }
+        if (mode != MODE_SLEEP) preview_pump();
+        if (!nfc_ok && esp_timer_get_time() >= nfc_retry_at) {
+            nfc_ok = pn532_init();
+            nfc_retry_at = esp_timer_get_time() + 5000000;
+        }
+        char uid[21];
+        int detected = nfc_ok ? pn532_read_uid(uid, mode == MODE_SLEEP ? NULL : preview_pump) : -1;
+        if (boot_requested()) { boot_action(); continue; }
+        if (detected < 0 && nfc_ok) {
+            if (++nfc_error_count >= 3) {
+                ESP_LOGW("NFC", "Repeated I2C error; reinitialize PN532");
+                nfc_ok = false;
+                nfc_retry_at = esp_timer_get_time() + 1000000;
+                nfc_error_count = 0;
+            }
+        } else if (detected >= 0) nfc_error_count = 0;
+        if (detected == 1) {
+            absent_reads = 0;
+            if (strcmp(uid, held_uid) != 0) {
+                strcpy(held_uid, uid);
+                verify_card(uid);
+            }
+        } else if (detected == 0) {
+            if (++absent_reads >= 2) held_uid[0] = 0;
+        }
+        if (mode == MODE_WAIT && esp_timer_get_time() >= wait_deadline) enter_sleep();
+        if (mode == MODE_SLEEP) idle_sleep_once();
+        else sleep_ms(30);
     }
 }

@@ -1,22 +1,80 @@
-# Build & dependencies của PlatformIO / ESP-IDF
-**/.pio/
-**/managed_components/
-**/dependencies.lock
-**/build/
-**/sdkconfig
+# One ignore policy at the repository root; applies to both ESP32 projects.
 
-# File cấu hình máy cá nhân của VS Code / Cursor
-**/.vscode/*
-!**/.vscode/settings.json
-!**/.vscode/tasks.json
-!**/.vscode/extensions.json
+# Local credentials (keep templates safe for sharing).
+secrets.h
+secrets.json
 
-# File nhạy cảm (mật khẩu Wi-Fi, API key, token...)
-**/secrets.h
-**/*secret*
+server_secrets.json
+server_data/
+
+!secrets.h.example
+
 .env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.p12
+*.pfx
+*.pem
+credentials.json
+service-account*.json
 
-# File rác hệ thống Xubuntu / Linux
+# PlatformIO / ESP-IDF generated output and downloaded components.
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+managed_components/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+sdkconfig.old
+sdkconfig.*.old
+# Keep sdkconfig.defaults, sdkconfig.<board>, partitions.csv, dependencies.lock.
+
+# Face images, embeddings, attendance data and local exports.
+server_data/
+captures/
+captures_*/
+*.part
+*.log
+*.zip
+
+# Python environments and caches.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Machine-specific editor settings; retain extension recommendations.
+**/.vscode/*
+!**/.vscode/extensions.json
+.idea/
+.history/
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# KiCad transient state/backups; retain schematic, PCB and project source.
+*.kicad_prl
+*.lck
+~*.lck
+*-backups/
+_autosave-*
+*.kicad_sch-bak
+*.kicad_pcb-bak
+fp-info-cache
+
+# OS metadata.
 .DS_Store
 Thumbs.db
-*.log
+Desktop.ini
+.Trash-*/

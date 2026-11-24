@@ -1,0 +1,67 @@
+.
+├── captures
+├── esp_thuong
+│   ├── CMakeLists.txt
+│   ├── dependencies.lock
+│   ├── .gitignore
+│   ├── include
+│   │   ├── my_library.h
+│   │   ├── README
+│   │   └── secrets.h
+│   ├── lib
+│   │   └── README
+│   ├── partitions.csv
+│   ├── platformio.ini
+│   ├── sdkconfig.defaults
+│   ├── sdkconfig.esp32dev
+│   ├── src
+│   │   ├── CMakeLists.txt
+│   │   ├── diagnostic_serial.h
+│   │   ├── diagnostics.h
+│   │   ├── idf_component.yml
+│   │   ├── main.c
+│   │   └── sub.c
+│   ├── test
+│   │   └── README
+│   └── .vscode
+│       ├── c_cpp_properties.json
+│       ├── extensions.json
+│       └── launch.json
+├── .gitignore
+├── README.md
+├── s3_cam
+│   ├── CMakeLists.txt
+│   ├── dependencies.lock
+│   ├── .gitignore
+│   ├── include
+│   │   ├── my_library.h
+│   │   ├── README
+│   │   └── secrets.h
+│   ├── lib
+│   │   └── README
+│   ├── partitions.csv
+│   ├── platformio.ini
+│   ├── sdkconfig.defaults
+│   ├── sdkconfig.esp32-s3-devkitc-1
+│   ├── src
+│   │   ├── CMakeLists.txt
+│   │   ├── diagnostics.hpp
+│   │   ├── idf_component.yml
+│   │   └── main.cpp
+│   ├── test
+│   │   └── README
+│   └── .vscode
+│       ├── c_cpp_properties.json
+│       ├── extensions.json
+│       └── launch.json
+├── so_do_mach.jpg
+├── some_code.txt
+├── tools
+│   ├── capture_faces.py
+│   ├── CAPTURE_GUIDE.md
+│   ├── lan_server.py
+│   ├── requirements-capture.txt
+│   └── server_data
+└── tree.txt
+
+16 directories, 49 files

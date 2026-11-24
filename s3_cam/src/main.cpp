@@ -1,67 +1,22 @@
-// S3_CAM - ESP-IDF / PlatformIO. Application source: src/main.cpp
-#include <algorithm>
-#include <cmath>
-#include "driver/gpio.h"
-#include "driver/spi_slave.h"
-#include "esp_camera.h"
-#include "dl_image_jpeg.hpp"
-#include "esp_sleep.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include <stdint.h>
-#include <string.h>
-#include "esp_heap_caps.h"
-#include "esp_rom_crc.h"
-#include "esp_err.h"
-
-enum { SLOT=32760, HEAD=20, CAP=SLOT-HEAD, DIM=512,
-       START=1, POLL, END_SESSION, IDLE=16, AIM, SAMPLING, MATCH, DENIED,
-       NO_FACE, BAD_REF, CAM_FAIL, AI_FAIL, LINK_FAIL, ENROLLED, ENROLL=4 };
-// Versioned template: MFN_S8_V1, ESP-DL 3.3.15, RGB888 preprocessing.
-#define TEMPLATE_VERSION 0x03331501u
-typedef struct {
-    uint32_t version;
-    float vector[DIM];
-} face_template_t;
-typedef char template_layout_check[(sizeof(face_template_t) == 2052) ? 1 : -1];
-typedef struct {
-    uint32_t magic, session, kind, size, crc;
-    uint8_t data[CAP];
-} packet_t;
-typedef char slot_layout_check[(sizeof(packet_t)==SLOT)?1:-1];
-static inline uint32_t checksum(const packet_t *p) {
-    uint32_t v=esp_rom_crc32_le(0,(const uint8_t*)p,16);
-    return esp_rom_crc32_le(v,p->data,p->size);
-}
-static inline void seal(packet_t *p,uint32_t session,uint32_t kind,uint32_t bytes) {
-    p->magic=0x34454346;
-    p->session=session; p->kind=kind; p->size=bytes;
-    p->crc=checksum(p);
-}
-static inline int valid(const packet_t *p) {
-    return p->magic==0x34454346 && p->size<=CAP && p->crc==checksum(p);
-}
-static inline packet_t *new_slot(void) {
-    packet_t *p=(packet_t*)heap_caps_calloc(1,SLOT,MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA);
-    ESP_ERROR_CHECK(p ? ESP_OK : ESP_ERR_NO_MEM);
-    return p;
-}
-
-#include "human_face_detect.hpp"
-#include "human_face_recognition.hpp"
-#include <vector>
+// S3: camera, preview, embedding and cosine verification. No network credentials.
+#include "my_library.h"
 
 static constexpr gpio_num_t CS=GPIO_NUM_48, READY=GPIO_NUM_42;
 static constexpr int W=320,H=240,N=W*H*3;
-static constexpr float THRESHOLD=0.60f;
+static constexpr float THRESHOLD=FACE_THRESHOLD;
 static uint8_t *rgb,*best;
 static float reference[DIM], best_quality;
 static bool enrolling;
+static bool streaming;
+static unsigned warmup_left;
+static uint8_t *enroll_jpeg;
+static uint32_t enroll_jpeg_size;
+static uint32_t enroll_capture_id;
 static std::vector<int> best_landmarks;
 static bool camera_on;
+// Retain identification after deinit so capture.json describes the captured sensor.
+static unsigned detected_sensor_pid;
+static const char *detected_sensor_name = "unknown";
 static int64_t start_us,first_face_us;
 static bool rotate_ai;
 static unsigned samples;
@@ -74,20 +29,44 @@ static void stop_camera() {
         camera_on=false;
     }
 }
-static bool open_camera() {
+static bool open_camera(framesize_t size = FRAMESIZE_QVGA) {
     camera_config_t c={};
     c.pin_pwdn=-1; c.pin_reset=-1; c.pin_xclk=15; c.pin_pclk=13;
     c.pin_sccb_sda=4; c.pin_sccb_scl=5;
     c.pin_vsync=6; c.pin_href=7;
     c.pin_d0=11; c.pin_d1=9; c.pin_d2=8; c.pin_d3=10;
     c.pin_d4=12; c.pin_d5=18; c.pin_d6=17; c.pin_d7=16;
-    c.xclk_freq_hz=20000000; c.ledc_timer=LEDC_TIMER_0; c.ledc_channel=LEDC_CHANNEL_0;
-    c.pixel_format=PIXFORMAT_JPEG; c.frame_size=FRAMESIZE_QVGA; c.jpeg_quality=16;
+    c.xclk_freq_hz=CAMERA_XCLK_HZ; c.ledc_timer=LEDC_TIMER_0; c.ledc_channel=LEDC_CHANNEL_0;
+    c.pixel_format=PIXFORMAT_JPEG; c.frame_size=size; c.jpeg_quality=CAMERA_JPEG_QUALITY;
     c.fb_count=1; c.fb_location=CAMERA_FB_IN_PSRAM; c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
+    detected_sensor_pid = 0;
+    detected_sensor_name = "unknown";
     esp_err_t result = esp_camera_init(&c);
     camera_on = result == ESP_OK;
     ESP_LOGI("FACE", "Camera init: %s", esp_err_to_name(result));
-    return camera_on;
+    if (!camera_on) return false;
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (!sensor) {
+        ESP_LOGE("FACE", "Camera initialized without a sensor handle");
+        stop_camera();
+        return false;
+    }
+    detected_sensor_pid = sensor->id.PID;
+    const camera_sensor_info_t *info = esp_camera_sensor_get_info(&sensor->id);
+    if (info && info->name) detected_sensor_name = info->name;
+    ESP_LOGI("FACE", "Sensor=%s PID=0x%04X expected=%s; XCLK=%d JPEG quality=%d",
+             detected_sensor_name, detected_sensor_pid, CAMERA_EXPECTED_NAME,
+             CAMERA_XCLK_HZ, CAMERA_JPEG_QUALITY);
+    if (sensor->id.PID != CAMERA_EXPECTED_PID) {
+        ESP_LOGW("FACE", "Sensor differs from configured hardware; using detected driver");
+    }
+    // Keep the tested driver's OV2640 defaults. Do not force exposure/gain/mirror:
+    // changing them here would change recognition images and existing enrollment.
+    ESP_LOGI("FACE", "Sensor state: AEC=%u AGC=%u AWB=%u hmirror=%u vflip=%u",
+             unsigned(sensor->status.aec), unsigned(sensor->status.agc),
+             unsigned(sensor->status.awb), unsigned(sensor->status.hmirror),
+             unsigned(sensor->status.vflip));
+    return true;
 }
 static bool load_refs() {
     if (rx->size != sizeof(face_template_t)) return false;
@@ -127,10 +106,13 @@ static float sharpness(const std::vector<int> &box) {
     }
     return float(squares / count - (sum / count) * (sum / count));
 }
-static bool sample_face() {
+static HumanFaceDetect &face_detector() {
     static HumanFaceDetect detector(HumanFaceDetect::MSRMNP_S8_V1);
+    return detector;
+}
+static bool sample_face() {
     dl::image::img_t image = {rgb, W, H, dl::image::DL_IMAGE_PIX_TYPE_RGB888};
-    auto &faces = detector.run(image);
+    auto &faces = face_detector().run(image);
     if (faces.size() != 1) return false;
     const auto &face = faces.front();
     if (face.box.size() != 4 || face.keypoint.size() != 10) return false;
@@ -172,54 +154,115 @@ static float compare(const face_template_t &feature) {
     return float(score);
 }
 static void finish(uint32_t outcome) {
-    stop_camera();
     state=outcome;
     seal(tx,sid,state,0);
 }
+// Preserve the ORIGINAL JPEG belonging to the RGB sample selected for embedding.
+// It is retained in PSRAM during the subsequent stream and chunked upload.
+static void stream_frame() {
+    if (!camera_on && !open_camera()) { finish(CAM_FAIL); return; }
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (!frame) { finish(CAM_FAIL); return; }
+    size_t bytes = frame->len <= CAP ? frame->len : 0;
+    if (bytes) memcpy(tx->data, frame->buf, bytes);
+    esp_camera_fb_return(frame);
+    seal(tx, sid, STREAM_FRAME, bytes);
+}
+
 static void sample_frame() {
-    camera_fb_t *fb=esp_camera_fb_get();
-    if(!fb) { finish(CAM_FAIL); return; }
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { finish(CAM_FAIL); return; }
+    size_t bytes = fb->len <= CAP ? fb->len : 0;
+    if (bytes) memcpy(tx->data, fb->buf, bytes);
+    if (warmup_left) {
+        --warmup_left;
+        esp_camera_fb_return(fb);
+        state = AIM;
+        seal(tx, sid, AIM, bytes);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        return;
+    }
     dl::image::jpeg_img_t jpeg = {fb->buf, fb->len};
     auto decoded = dl::image::sw_decode_jpeg(jpeg, dl::image::DL_IMAGE_PIX_TYPE_RGB888);
-    bool ok = decoded.data && decoded.width == W && decoded.height == H;
     rgb = static_cast<uint8_t *>(decoded.data);
-    size_t bytes=fb->len<=CAP ? fb->len : 0;
-    if(bytes) memcpy(tx->data,fb->buf,bytes);
-    esp_camera_fb_return(fb);
-    if(!ok) { heap_caps_free(rgb); rgb=nullptr; finish(CAM_FAIL); return; }
-    // Preview uses the original JPEG. Try the opposite sensor orientation on the
-    // next miss so a physically inverted module can still detect upright faces.
-    if(rotate_ai) {
-        for(int i=0;i<W*H/2;i++) for(int ch=0;ch<3;ch++)
-            std::swap(rgb[3*i+ch],rgb[3*(W*H-1-i)+ch]);
+    if (!rgb || decoded.width != W || decoded.height != H) {
+        esp_camera_fb_return(fb);
+        heap_caps_free(rgb); rgb = nullptr;
+        finish(CAM_FAIL); return;
     }
-    if(sample_face()) {
+    if (rotate_ai) {
+        for (int i=0; i<W*H/2; ++i) for (int ch=0; ch<3; ++ch)
+            std::swap(rgb[3*i+ch], rgb[3*(W*H-1-i)+ch]);
+    }
+    float previous_quality = best_quality;
+    if (sample_face()) {
         ++samples;
-        if(!first_face_us) first_face_us=esp_timer_get_time();
-    } else if(!samples) rotate_ai=!rotate_ai;
+        if (!first_face_us) first_face_us = esp_timer_get_time();
+        if (enrolling && best_quality > previous_quality) {
+            enroll_jpeg_size = 0;
+            if (enroll_jpeg && fb->len <= MAX_ENROLL_JPEG_SIZE) {
+                memcpy(enroll_jpeg, fb->buf, fb->len);
+                enroll_jpeg_size = fb->len;
+                enroll_capture_id = sid;
+            }
+        }
+    } else if (!samples) {
+        rotate_ai = !rotate_ai;
+    }
+    esp_camera_fb_return(fb);
     heap_caps_free(rgb); rgb = nullptr;
-    int64_t now=esp_timer_get_time();
-    if(first_face_us && now-first_face_us>=2000000) {
-        if(samples<3) { finish(NO_FACE); return; }
+    int64_t now = esp_timer_get_time();
+    if (first_face_us && now-first_face_us >= 2000000) {
+        if (samples < 3) { finish(NO_FACE); return; }
         face_template_t feature;
         if (!extract_feature(feature)) { finish(AI_FAIL); return; }
         if (enrolling) {
+            if (!enroll_jpeg_size) { finish(CAM_FAIL); return; }
             finish(ENROLLED);
             memcpy(tx->data, &feature, sizeof(feature));
             seal(tx, sid, ENROLLED, sizeof(feature));
-            return;
+        } else {
+            float score = compare(feature);
+            // A normalized dot product may exceed one by a few rounding bits.
+            score = std::max(-1.0f, std::min(1.0f, score));
+            finish(score >= THRESHOLD ? MATCH : DENIED);
+            memcpy(tx->data, &score, sizeof(score));
+            seal(tx, sid, state, sizeof(score));
+            ESP_LOGI("FACE", "cosine %.4f; sharpness %.1f", score, best_quality);
         }
-        float score = compare(feature);
-        finish(score>=THRESHOLD ? MATCH : DENIED);
-        memcpy(tx->data,&score,sizeof(score)); seal(tx,sid,state,sizeof(score));
-        ESP_LOGI("FACE","cosine %.3f; sharpness %.1f",score,best_quality);
-    } else if(!first_face_us && now-start_us>=10000000) finish(NO_FACE);
-    else { state=first_face_us ? SAMPLING : AIM; seal(tx,sid,state,bytes); }
+    } else if (!first_face_us && now-start_us >= 15000000) {
+        finish(NO_FACE);
+    } else {
+        state = first_face_us ? SAMPLING : AIM;
+        seal(tx, sid, state, bytes);
+    }
 }
+
+static void image_reply() {
+    // Request: capture ID + byte offset. Reply: capture ID + total + offset + bytes.
+    uint32_t capture=0, offset=0;
+    if (rx->size == 8) {
+        memcpy(&capture, rx->data, 4);
+        memcpy(&offset, rx->data+4, 4);
+    }
+    if (!enroll_jpeg_size || capture != enroll_capture_id || offset >= enroll_jpeg_size) {
+        seal(tx, sid, CAM_FAIL, 0); return;
+    }
+    uint32_t bytes = std::min(enroll_jpeg_size-offset, uint32_t(IMAGE_CHUNK_SIZE));
+    memcpy(tx->data, &capture, 4);
+    memcpy(tx->data+4, &enroll_jpeg_size, 4);
+    memcpy(tx->data+8, &offset, 4);
+    memcpy(tx->data+12, enroll_jpeg+offset, bytes);
+    seal(tx, sid, IMAGE_DATA, bytes+12);
+}
+#include "diagnostics.hpp"
+
 static void prepared(spi_slave_transaction_t*) { gpio_set_level(READY,1); }
 static void finished(spi_slave_transaction_t*) { gpio_set_level(READY,0); }
 static void wait_for_boot_button() {
+    diag_clear();
     stop_camera();
+    streaming=false; enroll_jpeg_size=0; enroll_capture_id=0;
     memset(reference,0,sizeof(reference));
     sid=0; state=IDLE;
     seal(tx,0,IDLE,0);
@@ -232,6 +275,7 @@ static void wait_for_boot_button() {
 extern "C" void app_main() {
     tx=new_slot(); rx=new_slot();
     best=(uint8_t*)heap_caps_malloc(N,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    enroll_jpeg=(uint8_t*)heap_caps_malloc(MAX_ENROLL_JPEG_SIZE,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     gpio_set_direction(READY,GPIO_MODE_OUTPUT); gpio_set_level(READY,0);
     spi_bus_config_t b={}; b.sclk_io_num=21; b.mosi_io_num=47; b.miso_io_num=41;
     b.quadhd_io_num=-1; b.quadwp_io_num=-1; b.max_transfer_sz=SLOT;
@@ -239,7 +283,7 @@ extern "C" void app_main() {
     s.post_setup_cb=prepared; s.post_trans_cb=finished;
     ESP_ERROR_CHECK(spi_slave_initialize(SPI2_HOST,&b,&s,SPI_DMA_CH_AUTO));
     gpio_pullup_en(CS);
-    ESP_LOGI("FACE", "S3 SPI face v4 ready; waiting for U2 BOOT");
+    ESP_LOGI("FACE", "S3 LAN face ready; waiting for regular ESP32");
     wait_for_boot_button();
     while(true) {
         spi_slave_transaction_t t={}; t.length=SLOT*8; t.tx_buffer=tx; t.rx_buffer=rx;
@@ -249,6 +293,7 @@ extern "C" void app_main() {
         // stopping capture. Never reuse a transaction still owned by the driver.
         // Keep the queued transaction and DMA buffers alive while waiting.
         // Do not queue another transaction until this one completes.
+        int64_t clocks_deadline = esp_timer_get_time() + 60000000;
         while (true) {
             esp_err_t err = spi_slave_get_trans_result(
                 SPI2_HOST,
@@ -261,6 +306,13 @@ extern "C" void app_main() {
             }
 
             if (err == ESP_ERR_TIMEOUT) {
+                if (esp_timer_get_time() > clocks_deadline) {
+                    // Never free/reuse DMA buffers owned by a queued SPI transaction.
+                    // Reset recovers the driver, then startup returns to light sleep.
+                    stop_camera();
+                    ESP_LOGE("FACE", "No SPI clocks for 60 seconds; restart into sleep");
+                    esp_restart();
+                }
                 ESP_LOGW(
                     "FACE",
                     "Waiting SPI clocks: CS=%d READY=%d",
@@ -273,7 +325,7 @@ extern "C" void app_main() {
             ESP_LOGE("FACE", "SPI receive failed: %s", esp_err_to_name(err));
             ESP_ERROR_CHECK(err);
         }
-        if(camera_on && esp_timer_get_time()-start_us>20000000) finish(NO_FACE);
+
         if (t.trans_len != SLOT * 8) {
             ESP_LOGW(
                 "FACE",
@@ -299,19 +351,44 @@ extern "C" void app_main() {
             ESP_LOGW("FACE", "SPI packet has session=0");
             continue;
         }
-        if((rx->kind==START || rx->kind==ENROLL) && rx->session!=sid) {
-            stop_camera(); sid=rx->session;
-            best_quality=-1; first_face_us=0; samples=0; rotate_ai=false;
-            enrolling = rx->kind == ENROLL;
-            ESP_LOGI("FACE", "Session %lu: %s", (unsigned long)sid, enrolling ? "enroll" : "verify");
-            if(!enrolling && !load_refs()) finish(BAD_REF);
-            else if(!best) finish(AI_FAIL);
-            else if(!open_camera()) finish(CAM_FAIL);
-            else { start_us=esp_timer_get_time(); state=AIM; seal(tx,sid,state,0); }
-        } else if(rx->session==sid && rx->kind==END_SESSION) {
-            while(!gpio_get_level(CS)) vTaskDelay(1);
+        if (rx->kind == END_SESSION) {
+            // Accept even after the regular ESP32 rebooted and forgot the old session.
+            while (!gpio_get_level(CS)) vTaskDelay(1);
             wait_for_boot_button();
+        } else if (rx->kind == DEBUG_CAPTURE) {
+            if (rx->session != sid || !diag_active) {
+                stop_camera(); diag_clear(); sid=rx->session;
+                streaming=false; enroll_jpeg_size=0;
+                diag_active=true;
+                diag_capture();
+            }
+            diag_ready();
+        } else if (rx->kind == DEBUG_GET && rx->session == sid && diag_active) {
+            diag_reply();
+        } else if (rx->kind == STREAM) {
+            if (diag_active) { diag_clear(); stop_camera(); }
+            sid=rx->session; streaming=true;
+            stream_frame();
+        } else if ((rx->kind == START || rx->kind == ENROLL) && rx->session != sid) {
+            if (diag_active) { diag_clear(); stop_camera(); }
+            sid=rx->session; streaming=false;
+            best_quality=-1; first_face_us=0; samples=0; rotate_ai=false;
+            enroll_jpeg_size=0; enroll_capture_id=0;
+            enrolling=rx->kind == ENROLL;
+            ESP_LOGI("FACE", "Session %lu: %s", (unsigned long)sid, enrolling ? "enroll" : "verify");
+            if (!enrolling && !load_refs()) finish(BAD_REF);
+            else if (!best || (enrolling && !enroll_jpeg)) finish(AI_FAIL);
+            else if (!camera_on && !open_camera()) finish(CAM_FAIL);
+            else {
+                warmup_left=FACE_WARMUP_FRAMES;
+                start_us=esp_timer_get_time(); state=AIM; seal(tx,sid,state,0);
+            }
+        } else if (rx->kind == IMAGE_GET && rx->session == sid && !diag_active) {
+            image_reply();
+        } else if (rx->session == sid && rx->kind == POLL && !diag_active) {
+            if (streaming) stream_frame();
+            else if (camera_on && (state == AIM || state == SAMPLING)) sample_frame();
+            // Terminal result remains in tx until explicit STREAM / START / ENROLL.
         }
-        else if(rx->session==sid && rx->kind==POLL && camera_on) sample_frame();
     }
 }
